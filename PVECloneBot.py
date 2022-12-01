@@ -45,8 +45,9 @@ def GetNodesList():
     return(Nodes)
 
 def GetCloneList(node):
+    global ZfsLabel
     Conn = SSHConnection(node, login='root')
-    PveSh = Conn.run('zfs list -r -o name,sync:label | grep test_label | awk \'{print $1}\'')
+    PveSh = Conn.run('zfs list -r -o name,sync:label | grep '+ ZfsLabel + ' | awk \'{print $1}\'')
     return(PveSh.stdout.decode("utf-8"))
 
 def GetVMList(node):
