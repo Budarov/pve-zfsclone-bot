@@ -23,12 +23,14 @@ def add_cron():
     fname = os.path.basename(sys.argv[0])
     for job in cron:
         if fname in str(job):
-            sys.exit('Task already has been added to crontab: ' + str(job))
+            print('Task already has been added to crontab: ' + str(job))
+            sys.exit(0)
     job = cron.new(command=sys.path[0]+'/'+fname+' -delta 96')
     job.hour.on(21)
     job.minute.on(0)
     cron.write()
-    sys.exit('Task has been added to crontab: ' + str(job))
+    print('Task has been added to crontab: ' + str(job))
+    sys.exit(0)
 
 # Проверка входных аргументов
 def check_args():
