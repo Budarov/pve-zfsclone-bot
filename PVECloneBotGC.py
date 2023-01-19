@@ -50,7 +50,7 @@ def check_args():
 
 # Получаем список датасетов
 def GetDatasets(PostFix):
-    cmd ='zfs list -o name'
+    cmd ='/usr/sbin/zfs list -o name'
     cmd2 = 'grep ' + PostFix
     list = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE)
     try:
@@ -69,11 +69,11 @@ def DelDatasets(Datasets, DeltaTime, ChekClone = False):
         Delta = Delta.seconds + (Delta.days * 86400)
         if Delta > DeltaTime:
             if not ChekClone:  
-                cmd = 'zfs get origin -H -o value ' + Dataset
+                cmd = '/usr/sbin/zfs get origin -H -o value ' + Dataset
                 output = subprocess.check_output(cmd.split())
                 output = output.decode('utf-8')
                 if (output != '-') and ('autosnap' in output):
-                    cmd ='zfs destroy -r ' + Dataset
+                    cmd ='/usr/sbin/zfs destroy -r ' + Dataset
                     try:
                         subprocess.check_output(cmd.split(), stderr=subprocess.STDOUT)
                     except subprocess.CalledProcessError as err:
