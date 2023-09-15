@@ -18,15 +18,38 @@ try:
 except ModuleNotFoundError:
     os.system('python3 -m pip -q install openssh_wrapper > /dev/null') 
     from openssh_wrapper import SSHConnection
+#Импортируем библиотеку для работы с hetzner robot api
+try:
+    from hetzner.robot import Robot
+except ModuleNotFoundError:
+    os.system('python3 -m pip -q install hetzner > /dev/null') 
+    from hetzner.robot import Robot
+
 
 Bot = telebot.TeleBot(os.environ['TG_CLONEBOT_TOKEN'], parse_mode='HTML')
+
 ZfsLabel = 'tg-clone'
 ClonePostfix = '_tg-clone'
 RollbackPostfix = '_tg-rollback'
 ResolvedChatid = list(map(int, os.environ['RES_CHATID'].split(',')))
 CrTarget = {}
 DelTarget = {}
+#Создаем подключение к hetzner robot api
+robot = Robot(os.environ['ROBOT_LOGIN'], os.environ['ROBOT_PASS'])
+#Словарь с тимами взаимодейсвия с сервером:
+resetTypes = {'sw': 'Послать Ctrl+Alt+Del',
+              'power': 'Нажать кнопку power on',
+              'power_long': 'Зажать кнопку power on',
+              'hw': 'Нажать кнопку reset',
+              'man': 'Руками выкл\вкл питание, включить сервер' }
+#Переменная для накопления данных и раздерения сессий по telegram id
+PowerTarget = {} 
+#Тут указывается интервал в секундах, сколько будет жить кнопка отправки запроса в API:
+powerBtnLiveTime = 30
+#Часть имен серверов, которые будут пропущены в списке серверов
+skipSrvPrefix = 'MAX'
 
+#Функция проверки разрешенных telegram id для работы с ботом 
 def UserVerification (id, ResolvedChatid):
     if id in ResolvedChatid:
         return(True)
@@ -34,6 +57,21 @@ def UserVerification (id, ResolvedChatid):
         Bot.send_message(id, "Hello! This is a private bot. Your chat id is not allowed. Your chat id: " + str(id))
 
 #----------------Общие функции--------------
+
+
+#Функция проверки что кнопка свежая 
+def powerBtnLiveTimeVerification(timestamp):
+    global powerBtnLiveTime
+    btnLiveTime = datetime.timedelta(seconds=powerBtnLiveTime)
+    btnTime = datetime.datetime.fromtimestamp(int(timestamp))
+    now = datetime.datetime.now()
+    deltaTime = now - btnTime
+    if deltaTime >= btnLiveTime:
+        return(False)
+    else:
+        return(True)
+
+
 
 def GetNodesList():
     Conn = SSHConnection(socket.gethostname(), login='root')
@@ -62,7 +100,6 @@ def GetVMList(node):
 
 def GetVMSnapshot(Node, Dataset, grep = ''):
     Conn = SSHConnection(Node, login='root')
-    # PveSh = Conn.run('zfs list -t snapshot -o name | grep autosnap | grep ' + Dataset + ' | grep -v ' + ClonePostfix + ' | grep -v :15: | grep -v :45:')
     PveSh = Conn.run('zfs list -t snapshot -o name | grep autosnap | grep ' + Dataset + ' | grep -v ' + ClonePostfix + ' | grep -v ' + RollbackPostfix)
     print('zfs list -t snapshot -o name | grep autosnap | grep ' + Dataset + ' | grep -v ' + ClonePostfix + ' | grep -v ' + RollbackPostfix)
     PveSh = PveSh.stdout.decode("utf-8").split()
@@ -92,7 +129,6 @@ def GetVMRunStatus(Node, VMid):
     return(Status['qmpstatus'])
 
 def GetDiskNameSize(conf):
-    #for cfg in conf.split(":")[1].split(","):
     Name = 'cdrom'
     Size = 'cdrom'
     for cfg in conf.split(","):
@@ -130,7 +166,6 @@ def ZFSRollback(Node, Snapshot):
     Conn.run('zfs clone ' + NewSnapshot + ' ' + Dataset)
     Conn.run('zfs set sync:label=' + date + RollbackPostfix + ' ' + NewDataset)
     Conn.run('zfs promote ' + Dataset)
-    #return(NewDataset)
 
 def AddDisk(CrTarget):
     Conn = SSHConnection(CrTarget['Node'], login='root')
@@ -143,8 +178,8 @@ def AddDisk(CrTarget):
         if port not in ScsiList:
             scsi = port
             break 
-    #PveSh = Conn.run('pvesh set /nodes/' + CrTarget['Node'] + '/qemu/' + CrTarget['VMid'] + '/config/ -' + scsi + '=' + CrTarget['TgDisk'].split(":")[0] + ':' + CrTarget['TgDisk'].split(":")[1].split(",")[0] + '_tg-clone' + ',backup=0,replicate=0,discard=on')
     PveSh = Conn.run('pvesh set /nodes/' + CrTarget['Node'] + '/qemu/' + CrTarget['VMid'] + '/config/ -' + scsi + '=' + CrTarget['TgDisk'].split(":")[0] + ':' +  CrTarget['NewDataset'].split('/')[-1] + ',backup=0,replicate=0,discard=on')
+
 def Delete(Node, VMid, Port):
     Conn = SSHConnection(Node, login='root')
     PveSh = Conn.run('pvesh set /nodes/' + Node + '/qemu/' + VMid + '/config -delete ' + Port)
@@ -162,6 +197,9 @@ Nodes =[]
 @Bot.message_handler(commands=['start'])
 def start_command(message):
     if UserVerification(message.chat.id, ResolvedChatid):
+        # Создаем\обнуляем глобальные переменные по упралению питанием
+        global PowerTarget
+        PowerTarget[message.chat.id] = {}
         # Накапливаем данные от обработчика к обработчику
         global CrTarget
         CrTarget[message.chat.id] = {}
@@ -184,28 +222,13 @@ def start_command(message):
         markup.add(itembtn1)
         Bot.send_message(message.chat.id, "Откат диска VM к ZFS снапшоту за выбранное время для восстановления <b>диска целиком</b>:", reply_markup=markup)
 
-# --------------- Просмотр сужествующих клонов ---------------
+        # --------------- Вывод основных кнопок откат диска ---------------
+        markup = types.InlineKeyboardMarkup()
+        itembtn1 = types.InlineKeyboardButton(text='Управление питанием серверов', callback_data='hetzner')
+        markup.add(itembtn1)
+        Bot.send_message(message.chat.id, " Управление физическим питанием серверов через <b>Hetzner Robot API</b>:", reply_markup=markup)
 
-# @Bot.callback_query_handler(func = lambda call: call.data == 'list_all_clone')
-# def list_all_clone_command(call):
-#     if UserVerification(call.from_user.id, ResolvedChatid):
-#         markup = types.InlineKeyboardMarkup()
-#         for key, value in ClasterList.items():
-#             markup.add(types.InlineKeyboardButton(text=key, callback_data='list_clone_cluster:'+key))
-#         Bot.send_message(call.from_user.id, 'Выбирите кластер:', reply_markup=markup)
-
-# @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "list_clone_cluster")
-# def ListClone(call):
-#     data = call.data.split(":")[1]
-#     NoClone = True
-#     for NodeName, NodeIp in ClasterList[data].items():
-#         clone = GetCloneList(NodeIp)
-#         if str(clone) != '':
-#             msg = 'Клоны на <b>' + NodeName + ':</b>\n' + clone + '\n\nВернутся в начало: /start'
-#             Bot.send_message(call.from_user.id, msg)
-#             NoClone = False
-#     if NoClone:
-#         Bot.send_message(call.from_user.id, 'Клоны на <b>' + data + ':</b> не найдены. \n\nВернутся в начало: /start')
+# --------------- Просмотр существующих клонов ---------------
 
 @Bot.callback_query_handler(func = lambda call: call.data == 'list_all_clone')
 def ListClone(call):
@@ -223,30 +246,12 @@ def ListClone(call):
 
 # --------------- Создание нового клона  и откат диска.---------------
 
-# @Bot.callback_query_handler(func = lambda call: call.data == 'create_clone')
-# def list_all_clone_command(call):
-#     if UserVerification(call.from_user.id, ResolvedChatid):
-#         markup = types.InlineKeyboardMarkup()
-#         for key, value in ClasterList.items():
-#             markup.add(types.InlineKeyboardButton(text=key, callback_data='create_clone_cluster:'+key))
-#         Bot.send_message(call.from_user.id, '<b>Создание клона.</b> Выбирите кластер:', reply_markup=markup)
-
-# @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "create_clone_cluster")
-# def CreateSelectNode(call):
-#     global CrTarget
-#     CrTarget['Cluster'] = call.data.split(":")[1]
-#     markup = types.InlineKeyboardMarkup()
-#     for NodeName, NodeIp in ClasterList[CrTarget['Cluster']].items():
-#         markup.add(types.InlineKeyboardButton(text=NodeName, callback_data='create_clone_node:' + NodeName))
-#     Bot.send_message(call.from_user.id, '<b>Создание клона.</b> Выбирите ноду:', reply_markup=markup)
-
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "create_clone")
 def CreateSelectNode(call):
     try:
         global CrTarget
         global Nodes
         Nodes = GetNodesList()
-        #CrTarget['Cluster'] = call.data.split(":")[1]
         if 'rollback' in call.data.split(":"):
             CrTarget[call.from_user.id]['rollback'] = True
             CrTarget[call.from_user.id]['msg'] = 'Откат диска.'
@@ -352,15 +357,6 @@ def CreateSelectTime(call):
             if (i == len(Times)) and (i % st) != 0:
                 for k in range(len(row)):
                     markup.add(row[k])             
-        # for Time in Times:
-        #     if i < st:
-        #         row.append(types.InlineKeyboardButton(text=Time, callback_data='create_clone_time-' + Time))
-        #         i = i + 1
-        #     else:
-        #         markup.add(row[0], row[1], row[2])
-        #         row = []
-        #         i = 0
-            #markup.add(types.InlineKeyboardButton(text=Time, callback_data='create_clone_time-' + Time))
         Bot.send_message(call.from_user.id, '<b>' + CrTarget[call.from_user.id]['msg'] + '</b> Выбирите Время:', reply_markup=markup)
     except KeyError:
         ToStart(call)
@@ -369,7 +365,6 @@ def CreateSelectTime(call):
 def DoCreateClone(call):
     try:
         global CrTarget
-        #Bot.answer_callback_query(callback_query_id=call.id, text='Я просто сообщение от бота, которое не останеться в истории переписки.', show_alert=True)
         CrTarget[call.from_user.id]['Time'] = call.data.split("-")[1]
         TgSnapshot = ''
         for Snapshot in CrTarget[call.from_user.id]['Snapshots']:
@@ -387,23 +382,6 @@ def DoCreateClone(call):
         ToStart(call)
 
 # ------------------------- Удаление клона ----------------------------
-
-# @Bot.callback_query_handler(func = lambda call: call.data == 'delete_clone')
-# def DelCloneCommand(call):
-#     if UserVerification(call.from_user.id, ResolvedChatid):
-#         markup = types.InlineKeyboardMarkup()
-#         for key, value in ClasterList.items():
-#             markup.add(types.InlineKeyboardButton(text=key, callback_data='del_clone_cluster:'+key))
-#         Bot.send_message(call.from_user.id, '<b>Удаление клона.</b> Выбирите кластер:', reply_markup=markup)
-
-# @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "del_clone_cluster")
-# def DelSelectNode(call):
-#     global CrTarget
-#     CrTarget['Cluster'] = call.data.split(":")[1]
-#     markup = types.InlineKeyboardMarkup()
-#     for NodeName, NodeIp in ClasterList[CrTarget['Cluster']].items():
-#         markup.add(types.InlineKeyboardButton(text=NodeName, callback_data='del_clone_node:' + NodeName))
-#     Bot.send_message(call.from_user.id, '<b>Удаление клона.</b> Выбирите ноду:', reply_markup=markup)
 
 @Bot.callback_query_handler(func = lambda call:  call.data == 'delete_clone')
 def DelSelectNode(call):
@@ -445,6 +423,117 @@ def ListClone(call):
             if DelTarget[call.from_user.id]['Disk'].split(":")[1].split(',')[0] in conf:
                 Bot.send_message(call.from_user.id, 'Удаление диска: ' + Delete(DelTarget[call.from_user.id]['Node'], DelTarget[call.from_user.id]['VMid'], port) + '\n\nВернутся в начало: /start')
     except KeyError:
+        ToStart(call)
+#--------------------------------------------------------------
+# Ниже находся обработчики работы с Hetzner Robot API:
+#--------------------------------------------------------------
+@Bot.callback_query_handler(func = lambda call:  call.data == 'hetzner')
+def hetznerBtnList(call):
+    try:
+        global PowerTarget
+        PowerTarget[call.from_user.id]['server'] = None
+        PowerTarget[call.from_user.id]['srvResetType'] = None
+        markup = types.InlineKeyboardMarkup()
+        for server in list(robot.servers):
+            if (server.ip != None) and (skipSrvPrefix not in server.name):
+                markup.add(types.InlineKeyboardButton(text = server.name + ' ' + server.ip, callback_data='hetzner_srv:' + str(server.number)))
+        Bot.send_message(call.from_user.id, '<b>Управление питанием.</b> Выбирите сервер:', reply_markup=markup)
+    except KeyError:
+        ToStart(call)
+    except NameError:
+        ToStart(call)
+    except AttributeError:
+        ToStart(call)
+
+@Bot.callback_query_handler(func = lambda call:  call.data.split(":")[0] == 'hetzner_srv')
+def hetzner_srv(call):
+    try:
+        global PowerTarget
+        PowerTarget[call.from_user.id]['server'] = robot.servers.get(int(call.data.split(":")[1]))
+        PowerTarget[call.from_user.id]['srvResetType'] = None
+        serverStatus = PowerTarget[call.from_user.id]['server'].reset.is_running
+        if serverStatus == None:
+            statusMsg = 'Сервер <b>' + PowerTarget[call.from_user.id]['server'].name + ' не поддерживает</b> передачу текущего состояния включен\выключен'
+        else:
+            if serverStatus:
+                statusMsg = 'Сервер <b>' + PowerTarget[call.from_user.id]['server'].name + ' включен</b> и работает.'
+            else:
+                statusMsg = 'Сервер <b>' + PowerTarget[call.from_user.id]['server'].name + ' выключен</b> и не работает.'
+        
+        srvResetTypes = PowerTarget[call.from_user.id]['server'].reset.reset_types
+        markup = types.InlineKeyboardMarkup()
+        now = datetime.datetime.now()
+        for srvResetType in srvResetTypes:
+            markup.add(types.InlineKeyboardButton(text = resetTypes[srvResetType], callback_data='hetzner_reset_question:' + now.strftime("%s") + ':' + srvResetType))
+        markup.add(types.InlineKeyboardButton(text = 'Послать Wake-on-LAN', callback_data='hetzner_wol'))
+        markup.add(types.InlineKeyboardButton(text = 'Выбрать другой сервер', callback_data='hetzner'))
+        Bot.send_message(call.from_user.id, statusMsg + ' Выбирите действие:', reply_markup=markup)
+    except NameError:
+        ToStart(call)
+    except KeyError:
+        ToStart(call)
+    except AttributeError:
+        ToStart(call)
+
+@Bot.callback_query_handler(func = lambda call:  call.data == 'hetzner_wol')
+def hetzner_wol(call):
+    try:
+        global PowerTarget
+        result = PowerTarget[call.from_user.id]['server'].wol.send_wol()
+        if result['wol']['server_number'] == PowerTarget[call.from_user.id]['server'].number:
+            Bot.send_message(call.from_user.id, 'Выполнено! Вернутся в начало: /start')
+        else:
+            Bot.send_message(call.from_user.id, 'Неожиданный результат: /start')
+    except KeyError:
+        ToStart(call)
+
+@Bot.callback_query_handler(func = lambda call:  call.data.split(":")[0] == 'hetzner_reset_question')
+def hetzner_reset_question(call):
+    try:
+        if powerBtnLiveTimeVerification(call.data.split(":")[1]):
+            global resetTypes
+            global PowerTarget
+            PowerTarget[call.from_user.id]['srvResetType'] = call.data.split(":")[2]
+            markup = types.InlineKeyboardMarkup()
+            now = datetime.datetime.now()
+            markup.add(types.InlineKeyboardButton(text = 'Всё верно, действуем!', callback_data='hetzner_reset_confirm:' + now.strftime("%s")))
+            markup.add(types.InlineKeyboardButton(text = 'Выбрать другой сервер.', callback_data='hetzner'))
+            Bot.send_message(call.from_user.id, '<b>Подтвердите:</b>\n' +  PowerTarget[call.from_user.id]['server'].name + 
+                            '\n' +  PowerTarget[call.from_user.id]['server'].ip + 
+                            '\n' + resetTypes[PowerTarget[call.from_user.id]['srvResetType']] + 
+                            '\nКонопка живет: ' + str(powerBtnLiveTime) + ' сек.', reply_markup=markup)
+        else:
+            ToStart(call)
+    except NameError:
+        ToStart(call)
+    except KeyError:
+        ToStart(call)
+    except AttributeError:
+        ToStart(call)
+
+@Bot.callback_query_handler(func = lambda call:  call.data.split(":")[0] == 'hetzner_reset_confirm')
+def hetzner_reset_question(call):
+    try:
+        if powerBtnLiveTimeVerification(call.data.split(":")[1]):
+            global PowerTarget
+            modes = {
+                    'man':'manual',
+                    'hw': 'hard',
+                    'sw': 'soft',
+                    'power': 'power',
+                    'power_long': 'power_long',
+                }
+            PowerTarget[call.from_user.id]['server'].reboot(mode=modes[PowerTarget[call.from_user.id]['srvResetType']])
+            PowerTarget[call.from_user.id]['server'] = None
+            PowerTarget[call.from_user.id]['srvResetType'] = None
+            Bot.send_message(call.from_user.id, 'Выполнено! Вернутся в начало: /start')
+        else:
+            ToStart(call)
+    except NameError:
+        ToStart(call)
+    except KeyError:
+        ToStart(call)
+    except AttributeError:
         ToStart(call)
 
 Bot.polling()
