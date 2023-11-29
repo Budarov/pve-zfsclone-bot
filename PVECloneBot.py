@@ -14,10 +14,11 @@ except ModuleNotFoundError:
     import telebot
 from telebot import types
 try:
-    from openssh_wrapper import SSHConnection
+    import openssh_wrapper 
 except ModuleNotFoundError:
     os.system('python3 -m pip -q install openssh_wrapper > /dev/null') 
-    from openssh_wrapper import SSHConnection
+    import openssh_wrapper
+from openssh_wrapper import SSHConnection
 #Импортируем библиотеку для работы с hetzner robot api
 try:
     from hetzner.robot import Robot
@@ -101,7 +102,7 @@ def GetVMList(node):
 def GetVMSnapshot(Node, Dataset, grep = ''):
     Conn = SSHConnection(Node, login='root')
     PveSh = Conn.run('zfs list -t snapshot -o name | grep autosnap | grep ' + Dataset + ' | grep -v ' + ClonePostfix + ' | grep -v ' + RollbackPostfix)
-    print('zfs list -t snapshot -o name | grep autosnap | grep ' + Dataset + ' | grep -v ' + ClonePostfix + ' | grep -v ' + RollbackPostfix)
+    #print('zfs list -t snapshot -o name | grep autosnap | grep ' + Dataset + ' | grep -v ' + ClonePostfix + ' | grep -v ' + RollbackPostfix)
     PveSh = PveSh.stdout.decode("utf-8").split()
     return(PveSh)
 
@@ -154,7 +155,7 @@ def CreateClone(Node, Snapshot):
     Conn.run('zfs set sync:label=' + ZfsLabel + ' ' + NewDataset)
     return(NewDataset)
 
-def ZFSRollback(Node, Snapshot):
+def ZFSRollback(Node, Snapshot, Mode='Clone'):
     now = datetime.datetime.now()
     date = now.strftime("%d-%m-%Y_%H:%M:%S")
     Conn = SSHConnection(Node, login='root')
@@ -162,10 +163,25 @@ def ZFSRollback(Node, Snapshot):
     Dataset = Snapshot.split("@")[0]
     NewDataset = Dataset + RollbackPostfix + '_' + date
     NewSnapshot = NewDataset + '@' + Snapshot.split("@")[1]
-    Conn.run('zfs rename ' + Dataset + ' ' + NewDataset)
-    Conn.run('zfs clone ' + NewSnapshot + ' ' + Dataset)
-    Conn.run('zfs set sync:label=' + date + RollbackPostfix + ' ' + NewDataset)
-    Conn.run('zfs promote ' + Dataset)
+    try:
+        if Mode == 'Rollback':
+            Conn.run('zfs rollback -r' + Snapshot)
+        if Mode == 'Clone':
+            Conn.run('zfs rename ' + Dataset + ' ' + NewDataset)
+            Conn.run('zfs clone ' + NewSnapshot + ' ' + Dataset)
+            Conn.run('zfs set sync:label=' + date + RollbackPostfix + ' ' + NewDataset)
+            Conn.run('zfs promote ' + Dataset)
+    except openssh_wrapper.SSHError as err:
+        raise openssh_wrapper.SSHError('SSHErr on ' + Node + ': ', err) 
+
+
+def PVEReplicaFix(Node, ReplicaTarget, Snapshot, JobID):
+    unix_timestamp = str(round(datetime.datetime.timestamp(datetime.datetime.now())))
+    Conn = SSHConnection(Node, login='root')
+    Dataset = Snapshot.split("@")[0]
+    PVESnapshot = Dataset + '@__replicate_' + JobID + '_' + unix_timestamp + '__'
+    Conn.run('zfs snapshot ' + PVESnapshot)
+    Conn.run('syncoid --no-sync-snap --sendoptions=-wR --force-delete ' + Dataset + ' root@' + ReplicaTarget + ':' + Dataset)
 
 def AddDisk(CrTarget):
     Conn = SSHConnection(CrTarget['Node'], login='root')
@@ -180,13 +196,28 @@ def AddDisk(CrTarget):
             break 
     PveSh = Conn.run('pvesh set /nodes/' + CrTarget['Node'] + '/qemu/' + CrTarget['VMid'] + '/config/ -' + scsi + '=' + CrTarget['TgDisk'].split(":")[0] + ':' +  CrTarget['NewDataset'].split('/')[-1] + ',backup=0,replicate=0,discard=on')
 
+def GetVMReplicaJobs(Node, VMid):
+    Conn = SSHConnection(Node, login='root')
+    PveSh = Conn.run('pvesh get nodes/'+ Node +'/replication --output-format json')
+    PveSh = PveSh.stdout.decode("utf-8")
+    Jobs = json.loads(PveSh)
+    Targets = []
+    for Job in Jobs:
+        if Job['guest'] == VMid:
+            Targets.append(Job)
+    return(Targets)
+
 def Delete(Node, VMid, Port):
     Conn = SSHConnection(Node, login='root')
     PveSh = Conn.run('pvesh set /nodes/' + Node + '/qemu/' + VMid + '/config -delete ' + Port)
     return(PveSh.stdout.decode("utf-8"))
 
-def ToStart(call):
-    Bot.send_message(call.from_user.id, 'Контекст диалога потерян, начните сначала: /start')
+def ToStart(call, err = ''):
+    if err == '':
+        text = 'Контекст диалога потерян, начните сначала: /start'
+    else:
+        text = '<b>Ошибка выполнения:</b>\n<code>' + str(err) + '</code>\n<b>Сообщите</b> о ошибке и начните сначала: /start'
+    Bot.send_message(call.from_user.id, text)
 
 # --------------- Обработчки ---------------
 
@@ -377,9 +408,18 @@ def DoCreateClone(call):
         if CrTarget[call.from_user.id]['rollback'] == True:
             ZFSRollback(CrTarget[call.from_user.id]['Node'], TgSnapshot)
             Bot.send_message(call.from_user.id, 'Откат диска <b>'+ CrTarget[call.from_user.id]['TgDisk'] +'</b> на ' + CrTarget[call.from_user.id]['Day'] + ' ' + CrTarget[call.from_user.id]['Time'] + ' на VM <b>' + CrTarget[call.from_user.id]['VMid'] + '</b> успешно произведен. Вернутся в начало диалога: /start')
+            if 'replicate=0' not in CrTarget[call.from_user.id]['TgDisk']:
+                ReplicaJobs = GetVMReplicaJobs(CrTarget[call.from_user.id]['Node'], CrTarget[call.from_user.id]['VMid'])
+                Bot.send_message(call.from_user.id, 'Начата починка репликаций PVE. Всего: <b>' + str(len(ReplicaJobs)) + '</b>')
+                for Job in ReplicaJobs:
+                    ZFSRollback(Job['target'], TgSnapshot, Mode='Rollback')
+                    PVEReplicaFix(CrTarget[call.from_user.id]['Node'], Job['target'],  TgSnapshot, Job['id'])  
+                    Bot.send_message(call.from_user.id, 'Исправление репликации id: <b>'+ Job['id'] +'</b> на <b>' + Job['target'] + '</b> успешно произведен. Вернутся в начало диалога: /start')             
         CrTarget = {}
     except KeyError:
         ToStart(call)
+    except openssh_wrapper.SSHError as err:
+        ToStart(call, err)
 
 # ------------------------- Удаление клона ----------------------------
 
