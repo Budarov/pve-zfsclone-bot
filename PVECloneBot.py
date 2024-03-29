@@ -253,11 +253,47 @@ def start_command(message):
         markup.add(itembtn1)
         Bot.send_message(message.chat.id, "Откат диска VM к ZFS снапшоту за выбранное время для восстановления <b>диска целиком</b>:", reply_markup=markup)
 
-        # --------------- Вывод основных кнопок откат диска ---------------
+        # --------------- Вывод кнопок управление физическим питанием серверов ---------------
         markup = types.InlineKeyboardMarkup()
         itembtn1 = types.InlineKeyboardButton(text='Управление питанием серверов', callback_data='hetzner')
         markup.add(itembtn1)
         Bot.send_message(message.chat.id, " Управление физическим питанием серверов через <b>Hetzner Robot API</b>:", reply_markup=markup)
+
+        #--------------- Вывод кнопок отключения swap ---------------
+        markup = types.InlineKeyboardMarkup()
+        itembtn1 = types.InlineKeyboardButton(text='Отключить swap', callback_data='swap_off')
+        markup.add(itembtn1)
+        Bot.send_message(message.chat.id, " Эустренное отключение swap на ноде в случае проблем.  <b>swapoff -av</b>:", reply_markup=markup)
+
+#--------------- Отключения Swap ---------------
+
+@Bot.callback_query_handler(func = lambda call: call.data == "swap_off")
+def SwapOffSelectNode(call):
+    try:
+        global CrTarget
+        global Nodes
+        Nodes = GetNodesList()
+        markup = types.InlineKeyboardMarkup()
+        for NodeName in Nodes:
+            markup.add(types.InlineKeyboardButton(text=NodeName, callback_data='swap_off_node:' + NodeName))
+        Bot.send_message(call.from_user.id, '<b>' + 'Отключение swap.' + '</b> Выбирите ноду:', reply_markup=markup)
+    except KeyError:
+        ToStart(call)
+
+@Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "swap_off_node")
+def SwapOffOnNode(call):
+    try:
+        global CrTarget
+        CrTarget[call.from_user.id]['Node'] = call.data.split(":")[1]
+        Conn = SSHConnection(CrTarget[call.from_user.id]['Node'], login='root')
+        PveSh = Conn.run('swapoff -av')
+        if PveSh.returncode == 0:
+            Bot.send_message(call.from_user.id, CrTarget[call.from_user.id]['Node'] + '\n<b>Команда выплнена.\nВывод stdout: '+ PveSh.stdout.decode("utf-8") +'\n/start </b>')
+        else:
+            Bot.send_message(call.from_user.id, CrTarget[call.from_user.id]['Node'] + '\n<b> Команда НЕ выплнена.\nВывод stderr: '+ PveSh.stderr.decode("utf-8") +'\n/start </b>')
+    except KeyError:
+        ToStart(call)
+
 
 # --------------- Просмотр существующих клонов ---------------
 
@@ -514,6 +550,7 @@ def hetzner_srv(call):
         ToStart(call)
     except AttributeError:
         ToStart(call)
+
 
 @Bot.callback_query_handler(func = lambda call:  call.data == 'hetzner_wol')
 def hetzner_wol(call):
