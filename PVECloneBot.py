@@ -59,7 +59,6 @@ def UserVerification (id, ResolvedChatid):
 
 #----------------Общие функции--------------
 
-
 #Функция проверки что кнопка свежая 
 def powerBtnLiveTimeVerification(timestamp):
     global powerBtnLiveTime
@@ -293,6 +292,8 @@ def SwapOffOnNode(call):
             Bot.send_message(call.from_user.id, CrTarget[call.from_user.id]['Node'] + '\n<b> Команда НЕ выплнена.\nВывод stderr: '+ PveSh.stderr.decode("utf-8") +'\n/start </b>')
     except KeyError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 
 # --------------- Просмотр существующих клонов ---------------
@@ -302,14 +303,17 @@ def ListClone(call):
     NoClone = True
     global Nodes
     Nodes = GetNodesList()
-    for NodeName in Nodes:
-        clone = GetCloneList(NodeName)
-        if str(clone) != '':
-            msg = 'Клоны на <b>' + NodeName + ':</b>\n' + clone + '\n\nВернутся в начало: /start'
-            Bot.send_message(call.from_user.id, msg)
-            NoClone = False
-    if NoClone:
-        Bot.send_message(call.from_user.id, 'Клоны <b>не найдены</b>. \n\nВернутся в начало: /start')
+    try:
+        for NodeName in Nodes:
+            clone = GetCloneList(NodeName)
+            if str(clone) != '':
+                msg = 'Клоны на <b>' + NodeName + ':</b>\n' + clone + '\n\nВернутся в начало: /start'
+                Bot.send_message(call.from_user.id, msg)
+                NoClone = False
+        if NoClone:
+            Bot.send_message(call.from_user.id, 'Клоны <b>не найдены</b>. \n\nВернутся в начало: /start')
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 # --------------- Создание нового клона  и откат диска.---------------
 
@@ -331,6 +335,8 @@ def CreateSelectNode(call):
         Bot.send_message(call.from_user.id, '<b>' + CrTarget[call.from_user.id]['msg'] + '</b> Выбирите ноду:', reply_markup=markup)
     except KeyError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "create_clone_node")
 def CreateSelectVMid(call):
@@ -346,6 +352,8 @@ def CreateSelectVMid(call):
         Bot.send_message(call.from_user.id, '<b>' + CrTarget[call.from_user.id]['msg'] + '</b> Выбирите VM:', reply_markup=markup)
     except KeyError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "create_clone_vmid")
 def CreateSelectDisk(call):
@@ -368,6 +376,8 @@ def CreateSelectDisk(call):
             Bot.send_message(call.from_user.id, '<b>' + CrTarget[call.from_user.id]['msg'] + '</b> Выбирите диск:', reply_markup=markup)
     except KeyError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "create_clone_disk")
 def CreateSelectDay(call):
@@ -396,6 +406,8 @@ def CreateSelectDay(call):
         ToStart(call)
     except IndexError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "create_clone_day")
 def CreateSelectTime(call):
@@ -427,6 +439,8 @@ def CreateSelectTime(call):
         Bot.send_message(call.from_user.id, '<b>' + CrTarget[call.from_user.id]['msg'] + '</b> Выбирите Время:', reply_markup=markup)
     except KeyError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 @Bot.callback_query_handler(func = lambda call: call.data.split("-")[0] == "create_clone_time")
 def DoCreateClone(call):
@@ -500,6 +514,8 @@ def ListClone(call):
                 Bot.send_message(call.from_user.id, 'Удаление диска: ' + Delete(DelTarget[call.from_user.id]['Node'], DelTarget[call.from_user.id]['VMid'], port) + '\n\nВернутся в начало: /start')
     except KeyError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 #--------------------------------------------------------------
 # Ниже находся обработчики работы с Hetzner Robot API:
 #--------------------------------------------------------------
@@ -520,6 +536,8 @@ def hetznerBtnList(call):
         ToStart(call)
     except AttributeError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 @Bot.callback_query_handler(func = lambda call:  call.data.split(":")[0] == 'hetzner_srv')
 def hetzner_srv(call):
@@ -550,6 +568,8 @@ def hetzner_srv(call):
         ToStart(call)
     except AttributeError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 
 @Bot.callback_query_handler(func = lambda call:  call.data == 'hetzner_wol')
@@ -563,6 +583,8 @@ def hetzner_wol(call):
             Bot.send_message(call.from_user.id, 'Неожиданный результат: /start')
     except KeyError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 @Bot.callback_query_handler(func = lambda call:  call.data.split(":")[0] == 'hetzner_reset_question')
 def hetzner_reset_question(call):
@@ -587,6 +609,8 @@ def hetzner_reset_question(call):
         ToStart(call)
     except AttributeError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 @Bot.callback_query_handler(func = lambda call:  call.data.split(":")[0] == 'hetzner_reset_confirm')
 def hetzner_reset_question(call):
@@ -612,5 +636,7 @@ def hetzner_reset_question(call):
         ToStart(call)
     except AttributeError:
         ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 
 Bot.polling()
