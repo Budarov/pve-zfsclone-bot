@@ -19,13 +19,18 @@ except ModuleNotFoundError:
     os.system('python3 -m pip -q install openssh_wrapper > /dev/null') 
     import openssh_wrapper
 from openssh_wrapper import SSHConnection
+
 #Импортируем библиотеку для работы с hetzner robot api
+#try:
+#    from hetzner.robot import Robot
+#except ModuleNotFoundError:
+#    os.system('python3 -m pip -q install hetzner > /dev/null') 
+#    from hetzner.robot import Robot
 try:
-    from hetzner.robot import Robot
+    import hetzner.robot
 except ModuleNotFoundError:
     os.system('python3 -m pip -q install hetzner > /dev/null') 
-    from hetzner.robot import Robot
-
+    import hetzner.robot
 
 Bot = telebot.TeleBot(os.environ['TG_CLONEBOT_TOKEN'], parse_mode='HTML')
 
@@ -36,7 +41,7 @@ ResolvedChatid = list(map(int, os.environ['RES_CHATID'].split(',')))
 CrTarget = {}
 DelTarget = {}
 #Создаем подключение к hetzner robot api
-robot = Robot(os.environ['ROBOT_LOGIN'], os.environ['ROBOT_PASS'])
+robot = hetzner.robot.Robot(os.environ['ROBOT_LOGIN'], os.environ['ROBOT_PASS'])
 #Словарь с тимами взаимодейсвия с сервером:
 resetTypes = {'sw': 'Послать Ctrl+Alt+Del',
               'power': 'Нажать кнопку power on',
@@ -538,6 +543,8 @@ def hetznerBtnList(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
+    except hetzner.RobotError as err:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения к API Hetzner: ' + str(err))
 
 @Bot.callback_query_handler(func = lambda call:  call.data.split(":")[0] == 'hetzner_srv')
 def hetzner_srv(call):
