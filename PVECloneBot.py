@@ -304,10 +304,10 @@ def start_command(message):
         Bot.send_message(message.chat.id, "Откат диска VM к ZFS снапшоту за выбранное время для восстановления <b>диска целиком</b>:", reply_markup=markup)
 
         # --------------- Вывод кнопок подключения бекапа как диска ---------------
-        markup = types.InlineKeyboardMarkup()
-        itembtn1 = types.InlineKeyboardButton(text='Подключение бекапа PBS как диска', callback_data='PBS')
-        markup.add(itembtn1)
-        Bot.send_message(message.chat.id, "Бекап выбранного диска будет подключен как диск к VM для восстановления файлов, без восстановления диска целиком:", reply_markup=markup)
+        #markup = types.InlineKeyboardMarkup()
+        #itembtn1 = types.InlineKeyboardButton(text='Подключение бекапа PBS как диска', callback_data='PBS')
+        #markup.add(itembtn1)
+        #Bot.send_message(message.chat.id, "Бекап выбранного диска будет подключен как диск к VM для восстановления файлов, без восстановления диска целиком:", reply_markup=markup)
 
         # --------------- Подключение floppy ---------------
         markup = types.InlineKeyboardMarkup()
