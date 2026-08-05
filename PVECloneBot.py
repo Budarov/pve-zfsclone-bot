@@ -158,6 +158,14 @@ def CreateClone(Node, Snapshot):
     Conn.run('zfs set sync:label=' + ZfsLabel + ' ' + NewDataset)
     return(NewDataset)
 
+def NeedsLoadKey(Node, Dataset):
+    Conn = SSHConnection(Node, login='root')
+    EncRoot = Conn.run('zfs get -H -o value encryptionroot ' + Dataset).stdout.decode("utf-8").strip()
+    if EncRoot != Dataset:
+        return False
+    KeyStatus = Conn.run('zfs get -H -o value keystatus ' + Dataset).stdout.decode("utf-8").strip()
+    return KeyStatus != 'available'
+
 def ZFSRollback(Node, Snapshot, Mode='Clone'):
     now = datetime.datetime.now()
     date = now.strftime("%d-%m-%Y_%H:%M:%S")
@@ -174,7 +182,8 @@ def ZFSRollback(Node, Snapshot, Mode='Clone'):
             Conn.run('zfs clone ' + NewSnapshot + ' ' + Dataset)
             Conn.run('zfs set sync:label=' + date + RollbackPostfix + ' ' + NewDataset)
             Conn.run('zfs promote ' + Dataset)
-            Conn.run('zfs load-key ' + Dataset)
+            if NeedsLoadKey(Node, Dataset):
+                Conn.run('zfs load-key ' + Dataset)
     except openssh_wrapper.SSHError as err:
         raise openssh_wrapper.SSHError('SSHErr on ' + Node + ': ', err) 
 
