@@ -1,8 +1,8 @@
 #!/usr/bin/python3
 # Token бота берется из системной переменной TG_CLONEBOT_TOKEN
 # Разрешенные ChatID берется из системной переменной RES_CHATID, где они перечислены через запятую. 
-
-import os, json, socket, datetime
+ 
+import os, json, socket, datetime, html
 try:
     import pip
 except ModuleNotFoundError:
@@ -19,7 +19,7 @@ except ModuleNotFoundError:
     os.system('python3 -m pip -q install openssh_wrapper > /dev/null') 
     import openssh_wrapper
 from openssh_wrapper import SSHConnection
-
+ 
 #Импортируем библиотеку для работы с hetzner robot api
 #try:
 #    from hetzner.robot import Robot
@@ -31,9 +31,31 @@ try:
 except ModuleNotFoundError:
     os.system('python3 -m pip -q install hetzner > /dev/null') 
     import hetzner.robot
-
+ 
+# --- FIX 421 Misdirected Request ---
+# Библиотека hetzner устанавливает TLS-соединение через устаревший ssl.wrap_socket
+# без server_hostname, то есть НЕ отправляет SNI. Hetzner перевел robot-ws.your-server.de
+# за инфраструктуру, где SNI обязателен -> Apache отвечает 421 (SNI не совпадает с Host).
+# Подменяем метод connect() на корректный: с SNI и штатной валидацией сертификата.
+import ssl as _ssl
+import socket as _socket
+import hetzner.util.http as _hz_http
+ 
+def _sni_connect(self):
+    sock = _socket.create_connection((self.host, self.port),
+                                     getattr(self, 'timeout', None))
+    if getattr(self, '_tunnel_host', None):
+        self.sock = sock
+        self._tunnel()
+    context = _ssl.create_default_context()
+    # server_hostname=self.host -> отправляем SNI, совпадающий с Host-заголовком.
+    self.sock = context.wrap_socket(sock, server_hostname=self.host)
+ 
+_hz_http.ValidatedHTTPSConnection.connect = _sni_connect
+# --- /FIX 421 ---
+ 
 Bot = telebot.TeleBot(os.environ['TG_CLONEBOT_TOKEN'], parse_mode='HTML')
-
+ 
 ZfsLabel = 'tg-clone'
 ClonePostfix = '_tg-clone'
 RollbackPostfix = '_tg-rollback'
@@ -42,7 +64,38 @@ CrTarget = {}
 DelTarget = {}
 FloppyPath = '/root/Sync/floppy'
 #Создаем подключение к hetzner robot api
-robot = hetzner.robot.Robot(os.environ['ROBOT_LOGIN'], os.environ['ROBOT_PASS'])
+#ВНИМАНИЕ: не переиспользуем один объект Robot на весь процесс.
+#Библиотека hetzner держит внутри persistent keep-alive соединение (self.conn),
+#которое при простое часами протухает и ловит 421 Misdirected Request (несовпадение SNI/Host).
+#Поэтому создаем свежий объект на каждое обращение к API через GetRobot().
+def GetRobot():
+    return hetzner.robot.Robot(os.environ['ROBOT_LOGIN'], os.environ['ROBOT_PASS'])
+ 
+def RobotServersList(retries=2):
+    #Список серверов со свежим соединением и одной повторной попыткой на 421.
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return list(GetRobot().servers)
+        except hetzner.RobotError as err:
+            last_err = err
+            if '421' in str(err):
+                continue
+            raise
+    raise last_err
+ 
+def RobotGetServer(number, retries=2):
+    #Получение конкретного сервера со свежим соединением и retry на 421.
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return GetRobot().servers.get(int(number))
+        except hetzner.RobotError as err:
+            last_err = err
+            if '421' in str(err):
+                continue
+            raise
+    raise last_err
 #Словарь с типами взаимодейсвия с сервером:
 resetTypes = {'sw': 'Послать Ctrl+Alt+Del',
               'power': 'Нажать кнопку power on',
@@ -55,16 +108,16 @@ PowerTarget = {}
 powerBtnLiveTime = 30
 #Часть имен серверов, которые будут пропущены в списке серверов
 skipSrvPrefix = 'MAX'
-
+ 
 #Функция проверки разрешенных telegram id для работы с ботом 
 def UserVerification (id, ResolvedChatid):
     if id in ResolvedChatid:
         return(True)
     else:
         Bot.send_message(id, "Hello! This is a private bot. Your chat id is not allowed. Your chat id: " + str(id))
-
+ 
 #----------------Общие функции--------------
-
+ 
 #Функция проверки что кнопка свежая 
 def powerBtnLiveTimeVerification(timestamp):
     global powerBtnLiveTime
@@ -76,7 +129,7 @@ def powerBtnLiveTimeVerification(timestamp):
         return(False)
     else:
         return(True)
-
+ 
 def GetNodesList():
     Conn = SSHConnection(socket.gethostname(), login='root')
     PveSh = Conn.run('pvesh get cluster/status --output-format json')
@@ -88,27 +141,27 @@ def GetNodesList():
             Nodes.append(node['name'])
     Nodes.sort()
     return(Nodes)
-
+ 
 def GetCloneList(node):
     global ZfsLabel
     Conn = SSHConnection(node, login='root')
     PveSh = Conn.run('zfs list -r -o name,sync:label | grep '+ ZfsLabel + ' | awk \'{print $1}\'')
     return(PveSh.stdout.decode("utf-8"))
-
+ 
 def GetVMList(node):
     Conn = SSHConnection(node, login='root')
     PveSh = Conn.run('pvesh get nodes/'+ node +'/qemu --output-format json')
     PveSh = PveSh.stdout.decode("utf-8")
     js = json.loads(PveSh)
     return(js)
-
+ 
 def GetVMSnapshot(Node, Dataset, grep = ''):
     Conn = SSHConnection(Node, login='root')
     PveSh = Conn.run('zfs list -t snapshot -o name | grep autosnap | grep ' + Dataset + ' | grep -v ' + ClonePostfix + ' | grep -v ' + RollbackPostfix)
     #print('zfs list -t snapshot -o name | grep autosnap | grep ' + Dataset + ' | grep -v ' + ClonePostfix + ' | grep -v ' + RollbackPostfix)
     PveSh = PveSh.stdout.decode("utf-8").split()
     return(PveSh)
-
+ 
 def GetVMDisks(Node, VMid, unused=False):
     Conn = SSHConnection(Node, login='root')
     PveSh = Conn.run('pvesh get nodes/'+ Node +'/qemu/' + VMid + '/config --output-format json')
@@ -124,14 +177,14 @@ def GetVMDisks(Node, VMid, unused=False):
             if (('sata' in key) or ('scsi' in key)) and (('disk' in value) or ('cdrom' in value)):
                 Disks[key]=value
     return(Disks)
-
+ 
 def GetVMRunStatus(Node, VMid):
     Conn = SSHConnection(Node, login='root')
     PveSh = Conn.run('pvesh get nodes/'+ Node +'/qemu/' + VMid + '/status/current --output-format json')
     PveSh = PveSh.stdout.decode("utf-8")
     Status = json.loads(PveSh)
     return(Status['qmpstatus'])
-
+ 
 def GetDiskNameSize(conf):
     Name = 'cdrom'
     Size = 'cdrom'
@@ -141,14 +194,14 @@ def GetDiskNameSize(conf):
         if 'size' in cfg:
             Size = cfg.split("=")[1]
     return(Name, Size)
-
+ 
 def GetDataset(Node, Storage):
     Conn = SSHConnection(Node, login='root')
     PveSh = Conn.run('pvesh get storage/' + Storage + '/ --output-format json')
     PveSh = PveSh.stdout.decode("utf-8")
     Dataset = json.loads(PveSh)['pool']
     return(Dataset)
-
+ 
 def CreateClone(Node, Snapshot):
     now = datetime.datetime.now()
     date = now.strftime("%d-%m-%Y_%H:%M:%S")
@@ -157,7 +210,7 @@ def CreateClone(Node, Snapshot):
     Conn.run('zfs clone ' + Snapshot + ' ' + NewDataset)
     Conn.run('zfs set sync:label=' + ZfsLabel + ' ' + NewDataset)
     return(NewDataset)
-
+ 
 def NeedsLoadKey(Node, Dataset):
     Conn = SSHConnection(Node, login='root')
     EncRoot = Conn.run('zfs get -H -o value encryptionroot ' + Dataset).stdout.decode("utf-8").strip()
@@ -165,7 +218,7 @@ def NeedsLoadKey(Node, Dataset):
         return False
     KeyStatus = Conn.run('zfs get -H -o value keystatus ' + Dataset).stdout.decode("utf-8").strip()
     return KeyStatus != 'available'
-
+ 
 def ZFSRollback(Node, Snapshot, Mode='Clone'):
     now = datetime.datetime.now()
     date = now.strftime("%d-%m-%Y_%H:%M:%S")
@@ -186,7 +239,7 @@ def ZFSRollback(Node, Snapshot, Mode='Clone'):
                 Conn.run('zfs load-key ' + Dataset)
     except openssh_wrapper.SSHError as err:
         raise openssh_wrapper.SSHError('SSHErr on ' + Node + ': ', err) 
-
+ 
 def PVEReplicaFix(Node, ReplicaTarget, Snapshot, JobID):
     unix_timestamp = str(round(datetime.datetime.timestamp(datetime.datetime.now())))
     Conn = SSHConnection(Node, login='root')
@@ -194,7 +247,7 @@ def PVEReplicaFix(Node, ReplicaTarget, Snapshot, JobID):
     PVESnapshot = Dataset + '@__replicate_' + JobID + '_' + unix_timestamp + '__'
     Conn.run('zfs snapshot ' + PVESnapshot)
     Conn.run('syncoid --no-sync-snap --sendoptions=-wR --force-delete ' + Dataset + ' root@' + ReplicaTarget + ':' + Dataset)
-
+ 
 def AddDisk(CrTarget):
     Conn = SSHConnection(CrTarget['Node'], login='root')
     scsi = ''
@@ -207,7 +260,7 @@ def AddDisk(CrTarget):
             scsi = port
             break 
     PveSh = Conn.run('pvesh set /nodes/' + CrTarget['Node'] + '/qemu/' + CrTarget['VMid'] + '/config/ -' + scsi + '=' + CrTarget['TgDisk'].split(":")[0] + ':' +  CrTarget['NewDataset'].split('/')[-1] + ',backup=0,replicate=0,discard=on')
-
+ 
 def GetVMReplicaJobs(Node, VMid):
     Conn = SSHConnection(Node, login='root')
     PveSh = Conn.run('pvesh get nodes/'+ Node +'/replication --output-format json')
@@ -218,21 +271,21 @@ def GetVMReplicaJobs(Node, VMid):
         if Job['guest'] == VMid:
             Targets.append(Job)
     return(Targets)
-
+ 
 def Delete(Node, VMid, Port):
     Conn = SSHConnection(Node, login='root')
     PveSh = Conn.run('pvesh set /nodes/' + Node + '/qemu/' + VMid + '/config -delete ' + Port)
     return(PveSh.stdout.decode("utf-8"))
-
+ 
 def ToStart(call, err = ''):
     if err == '':
         text = 'Контекст диалога потерян, начните сначала: /start'
     else:
-        text = '<b>Ошибка выполнения:</b>\n<code>' + str(err) + '</code>\n<b>Сообщите</b> о ошибке и начните сначала: /start'
+        text = '<b>Ошибка выполнения:</b>\n<code>' + html.escape(str(err)) + '</code>\n<b>Сообщите</b> о ошибке и начните сначала: /start'
     Bot.send_message(call.from_user.id, text)
-
+ 
 #---------- Фукции для подключения диска бекапа-------
-
+ 
 def GetVMBackups(Node, VMid):
     Conn = SSHConnection(Node, login='root')
     PveSh = Conn.run('proxmox-backup-client snapshot list vm/' + VMid + ' --output-format json --ns $(hostname)')
@@ -240,7 +293,7 @@ def GetVMBackups(Node, VMid):
     BackUps = json.loads(PveSh)
     sorted_list = sorted(BackUps, key=lambda x: x['backup-time'])
     return(sorted_list)
-
+ 
 def BackupLoopback(Node, VMid, backup, file):
     Conn = SSHConnection(Node, login='root')
     backup = datetime.datetime.utcfromtimestamp(backup).isoformat() + 'Z'
@@ -267,23 +320,23 @@ def LoopBloks(Node, loop):
     PveSh = Conn.run('blockdev --getsz '+ loop)
     PveSh = PveSh.stdout.decode("utf-8")
     return(str(PveSh))
-
+ 
 def DeviceMapper(Node, BackupBloks, BackupLoop, FileLoop):
     Conn = SSHConnection(Node, login='root')
     PveSh = Conn.run('echo \"0 ' + BackupBloks +' snapshot ' + BackupLoop + ' ' + FileLoop + ' P 8\" | dmsetup create snap-tg')
     return('snap-tg')
-
+ 
 def AddMappedDisk(Node, VMid, DeviceMap):
     Conn = SSHConnection(Node, login='root')
     #PveSh = Conn.run('sfdisk --disk-id /dev/mapper/snap-tg baf784e7-6bbd-4cfb-aaac-e86c96e166ee')
     PveSh = Conn.run('qm set ' + str(VMid) +' --scsi9 /dev/mapper/' + DeviceMap + ',replicate=0,backup=0')
-
+ 
 # --------------- Обработчки ---------------
-
+ 
 #------------------ /start------------------
 #Получаем список нод
 Nodes =[]
-
+ 
 @Bot.message_handler(commands=['start'])
 def start_command(message):
     if UserVerification(message.chat.id, ResolvedChatid):
@@ -305,39 +358,39 @@ def start_command(message):
         markup.add(itembtn1)
         markup.add(itembtn2, itembtn3)
         Bot.send_message(message.chat.id, "Клонирование диска VM из ZFS <b>снапшота</b> за выбранное время. Тонкий клон диска будет подключен к VM как SCSI диск для <b>файлового</b> восстановления:", reply_markup=markup)
-
+ 
         # --------------- Вывод основных кнопок откат диска ---------------
         markup = types.InlineKeyboardMarkup()
         itembtn1 = types.InlineKeyboardButton(text='Откат диска к выбранному времени', callback_data='create_clone:rollback')
         markup.add(itembtn1)
         Bot.send_message(message.chat.id, "Откат диска VM к ZFS снапшоту за выбранное время для восстановления <b>диска целиком</b>:", reply_markup=markup)
-
+ 
         # --------------- Вывод кнопок подключения бекапа как диска ---------------
         #markup = types.InlineKeyboardMarkup()
         #itembtn1 = types.InlineKeyboardButton(text='Подключение бекапа PBS как диска', callback_data='PBS')
         #markup.add(itembtn1)
         #Bot.send_message(message.chat.id, "Бекап выбранного диска будет подключен как диск к VM для восстановления файлов, без восстановления диска целиком:", reply_markup=markup)
-
+ 
         # --------------- Подключение floppy ---------------
         markup = types.InlineKeyboardMarkup()
         itembtn1 = types.InlineKeyboardButton(text='Подключить floppy-диск', callback_data='floppy_attach')
         markup.add(itembtn1)
         Bot.send_message(message.chat.id, "Создать и подключить пустой floppy-диск (1.44MB) к VM:", reply_markup=markup)
-
+ 
         # --------------- Вывод кнопок управление физическим питанием серверов ---------------
         markup = types.InlineKeyboardMarkup()
         itembtn1 = types.InlineKeyboardButton(text='Управление питанием серверов', callback_data='hetzner')
         markup.add(itembtn1)
         Bot.send_message(message.chat.id, " Управление физическим питанием серверов через <b>Hetzner Robot API</b>:", reply_markup=markup)
-
+ 
         #--------------- Вывод кнопок отключения swap ---------------
         markup = types.InlineKeyboardMarkup()
         itembtn1 = types.InlineKeyboardButton(text='Отключить swap', callback_data='swap_off')
         markup.add(itembtn1)
         Bot.send_message(message.chat.id, " Эустренное отключение swap на ноде в случае проблем.  <b>swapoff -av</b>:", reply_markup=markup)
-
+ 
 #--------------- Отключения Swap ---------------
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data == "swap_off")
 def SwapOffSelectNode(call):
     try:
@@ -350,7 +403,7 @@ def SwapOffSelectNode(call):
         Bot.send_message(call.from_user.id, '<b>' + 'Отключение swap.' + '</b> Выбирите ноду:', reply_markup=markup)
     except KeyError:
         ToStart(call)
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "swap_off_node")
 def SwapOffOnNode(call):
     try:
@@ -359,16 +412,16 @@ def SwapOffOnNode(call):
         Conn = SSHConnection(CrTarget[call.from_user.id]['Node'], login='root')
         PveSh = Conn.run('swapoff -av')
         if PveSh.returncode == 0:
-            Bot.send_message(call.from_user.id, CrTarget[call.from_user.id]['Node'] + '\n<b>Команда выплнена.\nВывод stdout: '+ PveSh.stdout.decode("utf-8") +'\n/start </b>')
+            Bot.send_message(call.from_user.id, CrTarget[call.from_user.id]['Node'] + '\n<b>Команда выплнена.\nВывод stdout: '+ html.escape(PveSh.stdout.decode("utf-8")) +'\n/start </b>')
         else:
-            Bot.send_message(call.from_user.id, CrTarget[call.from_user.id]['Node'] + '\n<b> Команда НЕ выплнена.\nВывод stderr: '+ PveSh.stderr.decode("utf-8") +'\n/start </b>')
+            Bot.send_message(call.from_user.id, CrTarget[call.from_user.id]['Node'] + '\n<b> Команда НЕ выплнена.\nВывод stderr: '+ html.escape(PveSh.stderr.decode("utf-8")) +'\n/start </b>')
     except KeyError:
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 # --------------- Просмотр существующих клонов ---------------
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data == 'list_all_clone')
 def ListClone(call):
     NoClone = True
@@ -385,9 +438,9 @@ def ListClone(call):
             Bot.send_message(call.from_user.id, 'Клоны <b>не найдены</b>. \n\nВернутся в начало: /start')
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 # --------------- Создание нового клона  и откат диска.---------------
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "create_clone")
 def CreateSelectNode(call):
     try:
@@ -408,7 +461,7 @@ def CreateSelectNode(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "create_clone_node")
 def CreateSelectVMid(call):
     try:
@@ -425,7 +478,7 @@ def CreateSelectVMid(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "create_clone_vmid")
 def CreateSelectDisk(call):
     try:
@@ -449,7 +502,7 @@ def CreateSelectDisk(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "create_clone_disk")
 def CreateSelectDay(call):
     try:
@@ -479,7 +532,7 @@ def CreateSelectDay(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "create_clone_day")
 def CreateSelectTime(call):
     try:
@@ -512,7 +565,7 @@ def CreateSelectTime(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split("-")[0] == "create_clone_time")
 def DoCreateClone(call):
     try:
@@ -541,9 +594,9 @@ def DoCreateClone(call):
         ToStart(call)
     except openssh_wrapper.SSHError as err:
         ToStart(call, err)
-
+ 
 # ------------------------- Удаление клона ----------------------------
-
+ 
 @Bot.callback_query_handler(func = lambda call:  call.data == 'delete_clone')
 def DelSelectNode(call):
     global DelTarget
@@ -552,7 +605,7 @@ def DelSelectNode(call):
     for NodeName in Nodes:
         markup.add(types.InlineKeyboardButton(text=NodeName, callback_data='del_clone_node:' + NodeName))
     Bot.send_message(call.from_user.id, '<b>Удаление клона.</b> Выбирите ноду:', reply_markup=markup)
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "del_clone_node")
 def DelSelectDisk(call):
     DelTarget[call.from_user.id]['Node'] =  call.data.split(":")[1]
@@ -569,7 +622,7 @@ def DelSelectDisk(call):
                 if ClonePostfix in conf:
                     markup.add(types.InlineKeyboardButton(text=VMid + ' Диск: ' + port + '  -  ' + conf.split(',')[0], callback_data='del_clone_disk:' + VMid + ':' + port))
         Bot.send_message(call.from_user.id, '<b>Удаление клона.</b> Выбирите клон:', reply_markup=markup)
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "del_clone_disk")
 def ListClone(call):
     try:
@@ -587,7 +640,7 @@ def ListClone(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 #--------------------------------------------------------------
 # Ниже находся подключения бекапа PBS:
 #--------------------------------------------------------------
@@ -606,7 +659,7 @@ def BackupBtnList(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "backup_node")
 def BackupSelectVMid(call):
     try:
@@ -623,7 +676,7 @@ def BackupSelectVMid(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "backup_vmid")
 def BackupSelectBackup(call):
     try:
@@ -638,7 +691,7 @@ def BackupSelectBackup(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "backup_backup")
 def BackupSelectFile(call):
     try:
@@ -655,7 +708,7 @@ def BackupSelectFile(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "backup_file")
 def ConnectBackup(call):
     try:
@@ -670,7 +723,7 @@ def ConnectBackup(call):
         BackupBloks = LoopBloks(CrTarget[call.from_user.id]['Node'], BackupLoop)  
         DeviceMap = DeviceMapper(CrTarget[call.from_user.id]['Node'], BackupBloks, BackupLoop, FileLoop)
         AddMappedDisk(CrTarget[call.from_user.id]['Node'], CrTarget[call.from_user.id]['VMid'],  DeviceMap) 
-
+ 
     except KeyError:
         ToStart(call)
     except openssh_wrapper.SSHError:
@@ -686,7 +739,7 @@ def hetznerBtnList(call):
         PowerTarget[call.from_user.id]['server'] = None
         PowerTarget[call.from_user.id]['srvResetType'] = None
         markup = types.InlineKeyboardMarkup()
-        for server in list(robot.servers):
+        for server in RobotServersList():
             if (server.ip != None) and (skipSrvPrefix not in server.name):
                 markup.add(types.InlineKeyboardButton(text = server.name + ' ' + server.ip, callback_data='hetzner_srv:' + str(server.number)))
         Bot.send_message(call.from_user.id, '<b>Управление питанием.</b> Выбирите сервер:', reply_markup=markup)
@@ -699,13 +752,14 @@ def hetznerBtnList(call):
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
     except hetzner.RobotError as err:
-        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения к API Hetzner: ' + str(err))
-
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения к API Hetzner: ' + html.escape(str(err)))
+ 
 @Bot.callback_query_handler(func = lambda call:  call.data.split(":")[0] == 'hetzner_srv')
 def hetzner_srv(call):
     try:
         global PowerTarget
-        PowerTarget[call.from_user.id]['server'] = robot.servers.get(int(call.data.split(":")[1]))
+        PowerTarget[call.from_user.id]['server_number'] = int(call.data.split(":")[1])
+        PowerTarget[call.from_user.id]['server'] = RobotGetServer(PowerTarget[call.from_user.id]['server_number'])
         PowerTarget[call.from_user.id]['srvResetType'] = None
         serverStatus = PowerTarget[call.from_user.id]['server'].reset.is_running
         if serverStatus == None:
@@ -732,13 +786,17 @@ def hetzner_srv(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+    except hetzner.RobotError as err:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения к API Hetzner: ' + html.escape(str(err)))
+ 
 @Bot.callback_query_handler(func = lambda call:  call.data == 'hetzner_wol')
 def hetzner_wol(call):
     try:
         global PowerTarget
-        result = PowerTarget[call.from_user.id]['server'].wol.send_wol()
-        if result['wol']['server_number'] == PowerTarget[call.from_user.id]['server'].number:
+        #Берем свежий объект сервера: соединение из hetzner_srv могло протухнуть за время диалога.
+        server = RobotGetServer(PowerTarget[call.from_user.id]['server_number'])
+        result = server.wol.send_wol()
+        if result['wol']['server_number'] == server.number:
             Bot.send_message(call.from_user.id, 'Выполнено! Вернутся в начало: /start')
         else:
             Bot.send_message(call.from_user.id, 'Неожиданный результат: /start')
@@ -746,7 +804,9 @@ def hetzner_wol(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+    except hetzner.RobotError as err:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения к API Hetzner: ' + html.escape(str(err)))
+ 
 @Bot.callback_query_handler(func = lambda call:  call.data.split(":")[0] == 'hetzner_reset_question')
 def hetzner_reset_question(call):
     try:
@@ -772,7 +832,7 @@ def hetzner_reset_question(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+ 
 @Bot.callback_query_handler(func = lambda call:  call.data.split(":")[0] == 'hetzner_reset_confirm')
 def hetzner_reset_question(call):
     try:
@@ -785,8 +845,11 @@ def hetzner_reset_question(call):
                     'power': 'power',
                     'power_long': 'power_long',
                 }
-            PowerTarget[call.from_user.id]['server'].reboot(mode=modes[PowerTarget[call.from_user.id]['srvResetType']])
+            #Берем свежий объект сервера прямо перед reboot, чтобы не попасть на протухшее соединение (421).
+            server = RobotGetServer(PowerTarget[call.from_user.id]['server_number'])
+            server.reboot(mode=modes[PowerTarget[call.from_user.id]['srvResetType']])
             PowerTarget[call.from_user.id]['server'] = None
+            PowerTarget[call.from_user.id]['server_number'] = None
             PowerTarget[call.from_user.id]['srvResetType'] = None
             Bot.send_message(call.from_user.id, 'Выполнено! Вернутся в начало: /start')
         else:
@@ -799,9 +862,11 @@ def hetzner_reset_question(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-
+    except hetzner.RobotError as err:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения к API Hetzner: ' + html.escape(str(err)))
+ 
 # ====================== FLOPPY ATTACH ======================
-
+ 
 @Bot.callback_query_handler(func=lambda call: call.data == 'floppy_attach')
 def FloppySelectNode(call):
     try:
@@ -813,19 +878,19 @@ def FloppySelectNode(call):
         Bot.send_message(call.from_user.id, '<b>Подключение floppy-диска</b>\nВыберите ноду:', reply_markup=markup)
     except Exception:
         ToStart(call)
-
-
+ 
+ 
 @Bot.callback_query_handler(func=lambda call: call.data.split(":")[0] == 'floppy_node')
 def FloppySelectVM(call):
     try:
         global CrTarget
         node = call.data.split(":")[1]
         CrTarget[call.from_user.id] = {'Node': node}
-
+ 
         markup = types.InlineKeyboardMarkup()
         VMs = GetVMList(node)
         VMs.sort(key=lambda x: x['vmid'])
-
+ 
         for VM in VMs:
             markup.add(types.InlineKeyboardButton(
                 text=f"{VM['vmid']} {VM['name']}",
@@ -834,8 +899,8 @@ def FloppySelectVM(call):
         Bot.send_message(call.from_user.id, f'<b>Подключение floppy</b> на ноде <b>{node}</b>\nВыберите VM:', reply_markup=markup)
     except Exception:
         ToStart(call)
-
-
+ 
+ 
 @Bot.callback_query_handler(func=lambda call: call.data.split(":")[0] == 'floppy_vmid')
 def FloppyCreateAndAttach(call):
     try:
@@ -843,44 +908,44 @@ def FloppyCreateAndAttach(call):
         vmid = call.data.split(":")[1]
         node = CrTarget[call.from_user.id]['Node']
         CrTarget[call.from_user.id]['VMid'] = vmid
-
+ 
         Conn = SSHConnection(node, login='root')
-
+ 
         # Создаём директорию
         #Conn.run(f'mkdir -p {FloppyPath}')
-
+ 
         floppy_name = f"floppy-{vmid}.img"
         floppy_fullpath = f"{FloppyPath}/{floppy_name}"
-
+ 
         # Проверяем, есть ли уже args с floppy
         config = Conn.run(f'cat /etc/pve/qemu-server/{vmid}.conf')
         config_text = config.stdout.decode()
-
+ 
         if 'drive=usbdrive' in config_text or 'floppy' in config_text:
             Bot.send_message(call.from_user.id, '⚠️ Floppy уже подключен к этой VM. Начните сначала /start')
             return
-
+ 
         # Создаём floppy образ
         Bot.send_message(call.from_user.id, f'Создаём floppy-образ для VM <b>{vmid}</b>...')
         result = Conn.run(f'dd if=/dev/zero of={floppy_fullpath} bs=1024 count=1440')
-
+ 
         if result.returncode != 0:
-            Bot.send_message(call.from_user.id, f'❌ Ошибка создания образа:\n{result.stderr.decode()}')
+            Bot.send_message(call.from_user.id, f'❌ Ошибка создания образа:\n{html.escape(result.stderr.decode())}')
             return
-
+ 
         Bot.send_message(call.from_user.id, f'✅ Floppy создан: <code>{floppy_name}</code>')
-
+ 
         # Добавляем в конфиг
         args_line = f'args: -drive file={floppy_fullpath},if=floppy,index=0,format=raw'
         Conn.run(f'echo "{args_line}" >> /etc/pve/qemu-server/{vmid}.conf')
-
+ 
         Bot.send_message(call.from_user.id,
             f'✅ Floppy успешно подключен к VM <b>{vmid}</b>!\n\n'
             f'Путь: <code>{floppy_fullpath}</code>\n\n'
             f'<b>Важно:</b> Перезапустите VM для применения изменений (/start)'
         )
-
+ 
     except Exception as e:
         ToStart(call, str(e))
-
+ 
 Bot.polling()
