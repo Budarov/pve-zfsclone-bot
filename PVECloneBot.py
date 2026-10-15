@@ -608,34 +608,71 @@ def DelSelectNode(call):
  
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "del_clone_node")
 def DelSelectDisk(call):
-    DelTarget[call.from_user.id]['Node'] =  call.data.split(":")[1]
-    DelTarget[call.from_user.id]['Disks'] = {}
-    Clones = GetCloneList(DelTarget[call.from_user.id]['Node'])
-    if str(Clones) == '':
-        Bot.send_message(call.from_user.id, 'Клонов на <b>' + DelTarget[call.from_user.id]['Node'] + '</b> не найдено. Выбирите другую ноду или начните сначала: /start')
-    else:
-        markup = types.InlineKeyboardMarkup()
-        for Dataset in Clones.split('\n'):
-            VMid = Dataset.split("/")[-1].split('-')[1]
-            DelTarget[call.from_user.id]['Disks'][VMid] = GetVMDisks(DelTarget[call.from_user.id]['Node'], VMid)
-            for port, conf in DelTarget[call.from_user.id]['Disks'][VMid].items():
-                if ClonePostfix in conf:
-                    markup.add(types.InlineKeyboardButton(text=VMid + ' Диск: ' + port + '  -  ' + conf.split(',')[0], callback_data='del_clone_disk:' + VMid + ':' + port))
-        Bot.send_message(call.from_user.id, '<b>Удаление клона.</b> Выбирите клон:', reply_markup=markup)
- 
-@Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "del_clone_disk")
-def ListClone(call):
     try:
-        DelTarget[call.from_user.id]['VMid'] =  call.data.split(":")[1]
-        DelTarget[call.from_user.id]['Port'] =  call.data.split(":")[2]
-        for port, conf in DelTarget[call.from_user.id]['Disks'][DelTarget[call.from_user.id]['VMid']].items():
-            if port == DelTarget[call.from_user.id]['Port']:
-                DelTarget[call.from_user.id]['Disk'] = conf
-        Bot.send_message(call.from_user.id, 'Отключение диска: ' + Delete(DelTarget[call.from_user.id]['Node'], DelTarget[call.from_user.id]['VMid'], DelTarget[call.from_user.id]['Port']))
-        UnusedDisks = GetVMDisks(DelTarget[call.from_user.id]['Node'], DelTarget[call.from_user.id]['VMid'], unused=True)
+        Node = call.data.split(":")[1]
+        DelTarget[call.from_user.id]['Node'] = Node
+        DelTarget[call.from_user.id]['Disks'] = {}
+        Clones = GetCloneList(Node)
+        if str(Clones) == '':
+            Bot.send_message(call.from_user.id, 'Клонов на <b>' + Node + '</b> не найдено. Выбирите другую ноду или начните сначала: /start')
+            return
+        markup = types.InlineKeyboardMarkup()
+        NotAttached = []
+        for Dataset in Clones.split('\n'):
+            # Снапшоты клонов (если на пуле listsnapshots=on) пропускаем
+            if '@' in Dataset:
+                continue
+            VolName = Dataset.split("/")[-1]
+            Attached = False
+            try:
+                VMid = VolName.split('-')[1]
+                if VMid not in DelTarget[call.from_user.id]['Disks']:
+                    # Ищем клон и среди подключенных (scsi/sata), и среди отключенных (unused) дисков VM
+                    Disks = GetVMDisks(Node, VMid)
+                    Disks.update(GetVMDisks(Node, VMid, unused=True))
+                    DelTarget[call.from_user.id]['Disks'][VMid] = Disks
+                for port, conf in DelTarget[call.from_user.id]['Disks'][VMid].items():
+                    if VolName in conf:
+                        markup.add(types.InlineKeyboardButton(text=VMid + ' Диск: ' + port + '  -  ' + conf.split(',')[0], callback_data='del_clone_disk:' + VMid + ':' + port))
+                        Attached = True
+            except (IndexError, ValueError):
+                # Имя датасета не по шаблону vm-<id>-... или VM с таким id нет на этой ноде
+                pass
+            if not Attached:
+                NotAttached.append(Dataset)
+        if NotAttached:
+            Bot.send_message(call.from_user.id, 'На <b>' + Node + '</b> есть клоны, которых нет в конфигурации VM (удаление диска ждет перезапуска VM в pending, VM на другой ноде или диск убран из конфига вручную):\n<code>' + html.escape('\n'.join(NotAttached)) + '</code>\nПроверьте <code>qm pending &lt;VMid&gt;</code>, при необходимости удалите вручную: <code>zfs destroy -r &lt;датасет&gt;</code>')
+        if markup.keyboard:
+            Bot.send_message(call.from_user.id, '<b>Удаление клона.</b> Выбирите клон:', reply_markup=markup)
+        else:
+            Bot.send_message(call.from_user.id, 'Клонов, подключенных к VM на <b>' + Node + '</b>, нет. Выбирите другую ноду или начните сначала: /start')
+    except KeyError:
+        ToStart(call)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
+
+@Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "del_clone_disk")
+def DelClone(call):
+    try:
+        Node = DelTarget[call.from_user.id]['Node']
+        VMid = call.data.split(":")[1]
+        Port = call.data.split(":")[2]
+        DelTarget[call.from_user.id]['VMid'] = VMid
+        DelTarget[call.from_user.id]['Port'] = Port
+        DelTarget[call.from_user.id]['Disk'] = DelTarget[call.from_user.id]['Disks'][VMid][Port]
+        # Имя тома без storage и опций. В имени клона есть ':' из времени, поэтому split(':', 1)
+        VolName = DelTarget[call.from_user.id]['Disk'].split(',')[0].split(':', 1)[1]
+        if Port.startswith('unused'):
+            # Диск уже отключен от VM: удаление unused-записи удаляет и сам том
+            Bot.send_message(call.from_user.id, 'Удаление диска: ' + Delete(Node, VMid, Port) + '\n\nВернутся в начало: /start')
+            return
+        Bot.send_message(call.from_user.id, 'Отключение диска: ' + Delete(Node, VMid, Port))
+        UnusedDisks = GetVMDisks(Node, VMid, unused=True)
         for port, conf in UnusedDisks.items():
-            if DelTarget[call.from_user.id]['Disk'].split(":")[1].split(',')[0] in conf:
-                Bot.send_message(call.from_user.id, 'Удаление диска: ' + Delete(DelTarget[call.from_user.id]['Node'], DelTarget[call.from_user.id]['VMid'], port) + '\n\nВернутся в начало: /start')
+            if VolName in conf:
+                Bot.send_message(call.from_user.id, 'Удаление диска: ' + Delete(Node, VMid, port) + '\n\nВернутся в начало: /start')
+                return
+        Bot.send_message(call.from_user.id, 'Диск отключен, но не появился в unused: вероятно VM запущена без hotplug дисков и отключение ушло в pending. После перезапуска VM удалите клон еще раз через «Удалить Клон». Вернутся в начало: /start')
     except KeyError:
         ToStart(call)
     except openssh_wrapper.SSHError:
