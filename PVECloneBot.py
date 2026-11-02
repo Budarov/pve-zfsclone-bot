@@ -2,7 +2,7 @@
 # Token бота берется из системной переменной TG_CLONEBOT_TOKEN
 # Разрешенные ChatID берется из системной переменной RES_CHATID, где они перечислены через запятую. 
  
-import os, json, socket, datetime, html
+import os, json, socket, datetime, html, re, shlex
 try:
     import pip
 except ModuleNotFoundError:
@@ -285,51 +285,185 @@ def ToStart(call, err = ''):
     Bot.send_message(call.from_user.id, text)
  
 #---------- Фукции для подключения диска бекапа-------
- 
+# Схема: proxmox-backup-client map даёт loop-устройство с бекапом (read-only). Поверх него создаётся
+# dm-snapshot с COW в sparse-файле, чтобы запись со стороны VM не меняла бекап. Получившийся
+# /dev/mapper/pbs-snap-<VMid> подключается к VM как scsiN.
+# Состояние подключения хранится на ноде в /var/tmp/pbs-snap-<VMid>.state (json), по нему работает отключение.
+# На одну VM - один подключенный бекап.
+PBSStateDir = '/var/tmp'
+PBSCowSizeGB = 5
+
+def PBSName(VMid):
+    return 'pbs-snap-' + str(VMid)
+
+def PBSStateFile(VMid):
+    return PBSStateDir + '/' + PBSName(VMid) + '.state'
+
+def PBSCowFile(VMid):
+    return PBSStateDir + '/' + PBSName(VMid) + '.cow'
+
+def NodeRun(Node, cmd):
+    r = SSHConnection(Node, login='root').run(cmd)
+    return r.returncode, r.stdout.decode('utf-8'), r.stderr.decode('utf-8')
+
+def CheckVMid(VMid):
+    # VMid приходит из callback_data и попадает в команды шелла
+    if not str(VMid).isdigit():
+        raise RuntimeError('Некорректный VMid: ' + str(VMid))
+    return str(VMid)
+
+def GetVMConfig(Node, VMid, current=False):
+    # current=True - текущее состояние VM, без отложенных (pending) изменений
+    cmd = 'pvesh get nodes/' + Node + '/qemu/' + VMid + '/config --output-format json'
+    if current:
+        cmd += ' --current 1'
+    rc, out, err = NodeRun(Node, cmd)
+    if rc != 0:
+        raise RuntimeError(err or out)
+    return json.loads(out)
+
 def GetVMBackups(Node, VMid):
-    Conn = SSHConnection(Node, login='root')
-    PveSh = Conn.run('proxmox-backup-client snapshot list vm/' + VMid + ' --output-format json --ns $(hostname)')
-    PveSh = PveSh.stdout.decode("utf-8")
-    BackUps = json.loads(PveSh)
+    rc, out, err = NodeRun(Node, 'proxmox-backup-client snapshot list vm/' + CheckVMid(VMid) + ' --output-format json --ns $(hostname)')
+    if rc != 0:
+        raise RuntimeError(err or out)
+    BackUps = json.loads(out)
     sorted_list = sorted(BackUps, key=lambda x: x['backup-time'])
     return(sorted_list)
- 
+
+def SaveBackupState(Node, VMid, State):
+    rc, out, err = NodeRun(Node, 'echo ' + shlex.quote(json.dumps(State)) + ' > ' + PBSStateFile(VMid))
+    if rc != 0:
+        raise RuntimeError(err)
+
+def LoadBackupState(Node, VMid):
+    rc, out, err = NodeRun(Node, 'cat ' + PBSStateFile(VMid))
+    if rc != 0:
+        return None
+    return json.loads(out)
+
+def ListBackupStates(Node):
+    rc, out, err = NodeRun(Node, 'cat ' + PBSStateDir + '/pbs-snap-*.state 2>/dev/null')
+    States = []
+    for line in out.splitlines():
+        try:
+            States.append(json.loads(line))
+        except ValueError:
+            pass
+    return States
+
 def BackupLoopback(Node, VMid, backup, file):
-    Conn = SSHConnection(Node, login='root')
-    backup = datetime.datetime.utcfromtimestamp(backup).isoformat() + 'Z'
-    file = file[:-5]
-    PveSh = Conn.run('proxmox-backup-client map vm/' + VMid + '/' + backup + ' ' + file + ' --ns $(hostname)')
-    PveSh = PveSh.stderr.decode("utf-8")
-    if 'Error' in  PveSh:
-      return(PveSh, True)
-    else:
-        return(PveSh.split(' ')[4], False)
-    
-def FileLoopback(Node):
-    Conn = SSHConnection(Node, login='root')
-    PveSh = Conn.run('dd if=/dev/zero of=/tmp/snapshot.img bs=1M count=2048')
-    PveSh = Conn.run('losetup /dev/loop5 /tmp/snapshot.img')
-    if PveSh.returncode != 0:
-        Err = PveSh.stderr.decode("utf-8")
-        return(Err, True)
-    else:
-        return('/dev/loop5', False)
-    
+    backup = datetime.datetime.fromtimestamp(backup, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    if file.endswith('.fidx'):
+        file = file[:-5]
+    rc, out, err = NodeRun(Node, 'proxmox-backup-client map vm/' + CheckVMid(VMid) + '/' + backup + ' ' + shlex.quote(file) + ' --ns $(hostname)')
+    Loop = re.search(r'/dev/loop\d+', out + err)
+    if rc != 0 or not Loop:
+        return(err or out or 'Не удалось определить loop-устройство', True)
+    return(Loop.group(0), False)
+
+def FileLoopback(Node, VMid):
+    # Sparse-файл для COW и свободное loop-устройство (без захардкоженного loop5)
+    Cow = PBSCowFile(CheckVMid(VMid))
+    rc, out, err = NodeRun(Node, 'rm -f ' + Cow + ' && truncate -s ' + str(PBSCowSizeGB) + 'G ' + Cow + ' && losetup -f --show ' + Cow)
+    if rc != 0:
+        return(err or out, True)
+    return(out.strip(), False)
+
 def LoopBloks(Node, loop):
-    Conn = SSHConnection(Node, login='root')
-    PveSh = Conn.run('blockdev --getsz '+ loop)
-    PveSh = PveSh.stdout.decode("utf-8")
-    return(str(PveSh))
- 
-def DeviceMapper(Node, BackupBloks, BackupLoop, FileLoop):
-    Conn = SSHConnection(Node, login='root')
-    PveSh = Conn.run('echo \"0 ' + BackupBloks +' snapshot ' + BackupLoop + ' ' + FileLoop + ' P 8\" | dmsetup create snap-tg')
-    return('snap-tg')
- 
+    rc, out, err = NodeRun(Node, 'blockdev --getsz ' + shlex.quote(loop))
+    return(out.strip())
+
+def DeviceMapper(Node, VMid, BackupBloks, BackupLoop, FileLoop):
+    Name = PBSName(CheckVMid(VMid))
+    if not BackupBloks.isdigit():
+        return('Не удалось получить размер устройства бекапа: ' + BackupBloks, True)
+    # N - непостоянный snapshot: заголовок на COW не нужен, после remove ничего не остаётся
+    rc, out, err = NodeRun(Node, 'echo ' + shlex.quote('0 ' + BackupBloks + ' snapshot ' + BackupLoop + ' ' + FileLoop + ' N 8') + ' | dmsetup create ' + Name)
+    if rc != 0:
+        return(err or out, True)
+    return(Name, False)
+
 def AddMappedDisk(Node, VMid, DeviceMap):
-    Conn = SSHConnection(Node, login='root')
-    #PveSh = Conn.run('sfdisk --disk-id /dev/mapper/snap-tg baf784e7-6bbd-4cfb-aaac-e86c96e166ee')
-    PveSh = Conn.run('qm set ' + str(VMid) +' --scsi9 /dev/mapper/' + DeviceMap + ',replicate=0,backup=0')
+    # Первый свободный scsi-порт начиная с scsi9 (по pending-конфигу, чтобы не занять уже выбранный)
+    Config = GetVMConfig(Node, VMid)
+    Port = ''
+    for i in range(9, 31):
+        if 'scsi' + str(i) not in Config:
+            Port = 'scsi' + str(i)
+            break
+    if Port == '':
+        return('Нет свободных scsi портов у VM', True)
+    rc, out, err = NodeRun(Node, 'qm set ' + VMid + ' --' + Port + ' /dev/mapper/' + DeviceMap + ',replicate=0,backup=0')
+    if rc != 0:
+        return(err or out, True)
+    return(Port, False)
+
+def ConnectBackupDisk(Node, VMid, Backup, File):
+    # Возвращает (порт, '') при успехе или (None, текст ошибки). При ошибке откатывает уже сделанные шаги.
+    CheckVMid(VMid)
+    if LoadBackupState(Node, VMid) is not None:
+        return(None, 'К VM ' + VMid + ' уже подключен бекап. Сначала отключите его.')
+    State = {'VMid': VMid, 'Backup': Backup, 'File': File}
+    try:
+        BackupLoop, Err = BackupLoopback(Node, VMid, Backup, File)
+        if Err:
+            return(None, BackupLoop)
+        State['BackupLoop'] = BackupLoop
+        SaveBackupState(Node, VMid, State)
+        CowLoop, Err = FileLoopback(Node, VMid)
+        if Err:
+            raise RuntimeError(CowLoop)
+        State['CowLoop'] = CowLoop
+        SaveBackupState(Node, VMid, State)
+        BackupBloks = LoopBloks(Node, BackupLoop)
+        DeviceMap, Err = DeviceMapper(Node, VMid, BackupBloks, BackupLoop, CowLoop)
+        if Err:
+            raise RuntimeError(DeviceMap)
+        Port, Err = AddMappedDisk(Node, VMid, DeviceMap)
+        if Err:
+            raise RuntimeError(Port)
+        State['Port'] = Port
+        SaveBackupState(Node, VMid, State)
+        return(Port, '')
+    except Exception as err:
+        try:
+            DisconnectBackup(Node, VMid)
+        except Exception:
+            pass
+        if isinstance(err, openssh_wrapper.SSHError):
+            raise
+        return(None, str(err))
+
+def DisconnectBackup(Node, VMid):
+    # Возвращает (лог шагов, ошибка?). Шаги терпимы к отсутствию отдельных частей, поэтому подходит и для отката.
+    CheckVMid(VMid)
+    Log = []
+    Name = PBSName(VMid)
+    Dev = '/dev/mapper/' + Name
+    State = LoadBackupState(Node, VMid) or {}
+    for port, conf in GetVMConfig(Node, VMid).items():
+        if port.startswith('scsi') and Dev in str(conf):
+            rc, out, err = NodeRun(Node, 'qm set ' + VMid + ' --delete ' + port)
+            if rc != 0:
+                return(Log + ['Не удалось отключить ' + port + ' от VM: ' + (err or out)], True)
+            Log.append('Диск ' + port + ' отключен от VM')
+    for port, conf in GetVMConfig(Node, VMid, current=True).items():
+        if port.startswith('scsi') and Dev in str(conf):
+            return(Log + [port + ' всё ещё подключен к запущенной VM (отключение в pending, hotplug недоступен). Перезапустите VM и повторите отключение.'], True)
+    rc, out, err = NodeRun(Node, 'dmsetup info ' + Name)
+    if rc == 0:
+        rc, out, err = NodeRun(Node, 'dmsetup remove --retry ' + Name)
+        if rc != 0:
+            return(Log + ['Не удалось удалить dm-устройство ' + Name + ': ' + (err or out)], True)
+        Log.append('Удалено dm-устройство ' + Name)
+    if State.get('CowLoop'):
+        rc, out, err = NodeRun(Node, 'losetup -d ' + shlex.quote(State['CowLoop']))
+        Log.append('Освобождён ' + State['CowLoop'] if rc == 0 else 'losetup -d ' + State['CowLoop'] + ': ' + (err or out))
+    if State.get('BackupLoop'):
+        rc, out, err = NodeRun(Node, 'proxmox-backup-client unmap ' + shlex.quote(State['BackupLoop']))
+        Log.append('Бекап отключён от ' + State['BackupLoop'] if rc == 0 else 'unmap ' + State['BackupLoop'] + ': ' + (err or out))
+    NodeRun(Node, 'rm -f ' + PBSCowFile(VMid) + ' ' + PBSStateFile(VMid))
+    return(Log, False)
  
 # --------------- Обработчки ---------------
  
@@ -366,10 +500,12 @@ def start_command(message):
         Bot.send_message(message.chat.id, "Откат диска VM к ZFS снапшоту за выбранное время для восстановления <b>диска целиком</b>:", reply_markup=markup)
  
         # --------------- Вывод кнопок подключения бекапа как диска ---------------
-        #markup = types.InlineKeyboardMarkup()
-        #itembtn1 = types.InlineKeyboardButton(text='Подключение бекапа PBS как диска', callback_data='PBS')
-        #markup.add(itembtn1)
-        #Bot.send_message(message.chat.id, "Бекап выбранного диска будет подключен как диск к VM для восстановления файлов, без восстановления диска целиком:", reply_markup=markup)
+        markup = types.InlineKeyboardMarkup()
+        itembtn1 = types.InlineKeyboardButton(text='Подключение бекапа PBS как диска', callback_data='PBS')
+        itembtn2 = types.InlineKeyboardButton(text='Отключить бекап PBS', callback_data='PBS_detach')
+        markup.add(itembtn1)
+        markup.add(itembtn2)
+        Bot.send_message(message.chat.id, "Бекап выбранного диска будет подключен как диск к VM для восстановления файлов, без восстановления диска целиком:", reply_markup=markup)
  
         # --------------- Подключение floppy ---------------
         markup = types.InlineKeyboardMarkup()
@@ -696,7 +832,6 @@ def BackupBtnList(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
- 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "backup_node")
 def BackupSelectVMid(call):
     try:
@@ -713,59 +848,117 @@ def BackupSelectVMid(call):
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
- 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "backup_vmid")
 def BackupSelectBackup(call):
     try:
         global CrTarget
-        CrTarget[call.from_user.id]['VMid'] = call.data.split(":")[1]
-        CrTarget['VMBackupsList'] = GetVMBackups(CrTarget[call.from_user.id]['Node'], CrTarget[call.from_user.id]['VMid'])
+        User = CrTarget[call.from_user.id]
+        User['VMid'] = call.data.split(":")[1]
+        # Список бекапов храним в данных пользователя, а не общим для всех
+        User['VMBackupsList'] = GetVMBackups(User['Node'], User['VMid'])
+        if not User['VMBackupsList']:
+            Bot.send_message(call.from_user.id, 'Бекапов VM <b>' + html.escape(User['VMid']) + '</b> в PBS не найдено. Выбирите другую VM или начните сначала: /start')
+            return
         markup = types.InlineKeyboardMarkup()
-        for Backup in CrTarget['VMBackupsList']:
+        # Новые сверху, не больше 50 кнопок (лимит Telegram на inline-клавиатуру)
+        for Backup in reversed(User['VMBackupsList'][-50:]):
             markup.add(types.InlineKeyboardButton(text=datetime.datetime.fromtimestamp(Backup['backup-time']).strftime('%d-%m-%Y %H:%M:%S'), callback_data='backup_backup:' + str(Backup['backup-time'])))
-        Bot.send_message(call.from_user.id, '<b>' + CrTarget[call.from_user.id]['msg'] + '</b> Выбирите дату бэкапа:', reply_markup=markup)
+        Bot.send_message(call.from_user.id, '<b>' + User['msg'] + '</b> Выбирите дату бэкапа:', reply_markup=markup)
     except KeyError:
         ToStart(call)
+    except RuntimeError as err:
+        ToStart(call, err)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
- 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "backup_backup")
 def BackupSelectFile(call):
     try:
         global CrTarget
-        CrTarget[call.from_user.id]['TgBackup'] = int(call.data.split(":")[1])
+        User = CrTarget[call.from_user.id]
+        User['TgBackup'] = int(call.data.split(":")[1])
         markup = types.InlineKeyboardMarkup()
-        for Backup in  CrTarget['VMBackupsList']:
-            if Backup['backup-time'] == CrTarget[call.from_user.id]['TgBackup']:
+        for Backup in User['VMBackupsList']:
+            if Backup['backup-time'] == User['TgBackup']:
                 for file in Backup['files']:
                     if '.img' in file['filename']:
-                        markup.add(types.InlineKeyboardButton(text=file['filename'] + ' ' + str(file['size']/1024/1024/1024) + ' Gb', callback_data='backup_file:' + file['filename']))
-        Bot.send_message(call.from_user.id, '<b>' + CrTarget[call.from_user.id]['msg'] + '</b> Выбирите файл диска:', reply_markup=markup)
+                        markup.add(types.InlineKeyboardButton(text=file['filename'] + ' ' + str(round(file['size']/1024/1024/1024, 1)) + ' Gb', callback_data='backup_file:' + file['filename']))
+        if not markup.keyboard:
+            Bot.send_message(call.from_user.id, 'В этом бекапе нет образов дисков. Выбирите другую дату или начните сначала: /start')
+            return
+        Bot.send_message(call.from_user.id, '<b>' + User['msg'] + '</b> Выбирите файл диска:', reply_markup=markup)
     except KeyError:
         ToStart(call)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
- 
 @Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "backup_file")
 def ConnectBackup(call):
     try:
         global CrTarget
-        CrTarget[call.from_user.id]['TgFile'] = call.data.split(":")[1]
-        BackupLoop, Err = BackupLoopback(CrTarget[call.from_user.id]['Node'], CrTarget[call.from_user.id]['VMid'], CrTarget[call.from_user.id]['TgBackup'], CrTarget[call.from_user.id]['TgFile'] )
+        User = CrTarget[call.from_user.id]
+        User['TgFile'] = call.data.split(":", 1)[1]
+        Bot.send_message(call.from_user.id, 'Подключаю бекап, это может занять несколько секунд...')
+        Port, Err = ConnectBackupDisk(User['Node'], User['VMid'], User['TgBackup'], User['TgFile'])
         if Err:
-            ToStart(call, BackupLoop)
-        FileLoop, Err = FileLoopback(CrTarget[call.from_user.id]['Node'])
-        if Err:
-            ToStart(call, FileLoop)
-        BackupBloks = LoopBloks(CrTarget[call.from_user.id]['Node'], BackupLoop)  
-        DeviceMap = DeviceMapper(CrTarget[call.from_user.id]['Node'], BackupBloks, BackupLoop, FileLoop)
-        AddMappedDisk(CrTarget[call.from_user.id]['Node'], CrTarget[call.from_user.id]['VMid'],  DeviceMap) 
- 
+            ToStart(call, Err)
+            return
+        Bot.send_message(call.from_user.id, '<b>Готово.</b> Бекап <code>' + html.escape(User['TgFile']) + '</code> от ' + datetime.datetime.fromtimestamp(User['TgBackup']).strftime('%d-%m-%Y %H:%M:%S') + ' подключен к VM <b>' + html.escape(User['VMid']) + '</b> как диск <b>' + Port + '</b> (запись идёт во временный файл на ноде, до ' + str(PBSCowSizeGB) + ' Gb, сам бекап не меняется).\n\nПосле восстановления файлов обязательно отключите бекап: /start -> «Отключить бекап PBS».')
     except KeyError:
         ToStart(call)
+    except RuntimeError as err:
+        ToStart(call, err)
     except openssh_wrapper.SSHError:
         Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
-        
+# ------------------------- Отключение бекапа ----------------------------
+
+@Bot.callback_query_handler(func = lambda call:  call.data == 'PBS_detach')
+def BackupDetachSelectNode(call):
+    try:
+        global Nodes
+        Nodes = GetNodesList()
+        markup = types.InlineKeyboardMarkup()
+        for NodeName in Nodes:
+            markup.add(types.InlineKeyboardButton(text=NodeName, callback_data='backup_dnode:' + NodeName))
+        Bot.send_message(call.from_user.id, '<b>Отключение бекапа.</b> Выбирите ноду:', reply_markup=markup)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
+@Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "backup_dnode")
+def BackupDetachSelectVM(call):
+    try:
+        global CrTarget
+        Node = call.data.split(":")[1]
+        CrTarget[call.from_user.id]['Node'] = Node
+        States = ListBackupStates(Node)
+        if not States:
+            Bot.send_message(call.from_user.id, 'Подключенных бекапов на <b>' + html.escape(Node) + '</b> не найдено. Выбирите другую ноду или начните сначала: /start')
+            return
+        markup = types.InlineKeyboardMarkup()
+        for State in States:
+            Time = datetime.datetime.fromtimestamp(State['Backup']).strftime('%d-%m-%Y %H:%M:%S') if 'Backup' in State else '?'
+            markup.add(types.InlineKeyboardButton(text='VM ' + str(State['VMid']) + ' ' + State.get('Port', '') + ' ' + State.get('File', '') + ' ' + Time, callback_data='backup_detach:' + str(State['VMid'])))
+        Bot.send_message(call.from_user.id, '<b>Отключение бекапа.</b> Выбирите бекап:', reply_markup=markup)
+    except KeyError:
+        ToStart(call)
+    except RuntimeError as err:
+        ToStart(call, err)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
+@Bot.callback_query_handler(func = lambda call: call.data.split(":")[0] == "backup_detach")
+def BackupDetach(call):
+    try:
+        Node = CrTarget[call.from_user.id]['Node']
+        VMid = call.data.split(":")[1]
+        Log, Err = DisconnectBackup(Node, VMid)
+        Text = html.escape('\n'.join(Log))
+        if Err:
+            Bot.send_message(call.from_user.id, '<b>Отключение не завершено:</b>\n<code>' + Text + '</code>\nПосле устранения причины повторите: /start')
+        else:
+            Bot.send_message(call.from_user.id, '<b>Бекап отключен.</b>\n<code>' + Text + '</code>\n\nВернутся в начало: /start')
+    except KeyError:
+        ToStart(call)
+    except RuntimeError as err:
+        ToStart(call, err)
+    except openssh_wrapper.SSHError:
+        Bot.send_message(call.from_user.id, '<b>Ошибка</b> подключения по SSH к ноде, нужно обновить отпечатки в ~/.ssh/known_hosts и попробовать еще раз: /start')
 #--------------------------------------------------------------
 # Ниже находся обработчики работы с Hetzner Robot API:
 #--------------------------------------------------------------
